@@ -1,0 +1,5 @@
+[package]
+name = "command"
+version = "0.7.0"
+eider = "0.7"
+description = "A program's command line derived from a record type: flags, subcommands, generated help, shell completions"

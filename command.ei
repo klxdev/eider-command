@@ -1,0 +1,852 @@
+//! command: a program's command line, derived from a record type (clap/cobra-style, with
+//! comptime reflection; eider-lang docs/compiler.md "C8.59", moved out of std in 0.7.3). Each field is a flag: `--name value`,
+//! `--name=value`, `-n value` (with a `short`), a bool is `--verbose` (or `--no-verbose`), an
+//! `Option[T]` may be left out, a `List[T]` is repeated or comma-separated, and anything else
+//! without a default is required. `--help` prints the generated usage.
+//!
+//!     import command
+//!
+//!     type Serve = {
+//!         @[command(help = "address to listen on", default = ":8080")] addr: String,
+//!         @[command(short = "w", help = "worker tasks", default = "4")] workers: i64,
+//!         @[command(short = "v", help = "log every request")] verbose: bool,
+//!         tags: List[String],
+//!     }
+//!
+//!     fn main() uses io {
+//!         let r: Result[command.Parsed[Serve], command.Error] = command.parse("serve", "run the server", command.arguments())
+//!         match r {
+//!             Ok(p) => run(p.opts, p.rest)
+//!             Err(e) => env.exit(command.report(e))
+//!         }
+//!     }
+//!
+//! Subcommands are an enum whose variants each carry one record of flags:
+//! `type Cmd = | Serve(opts: ServeFlags) | MigrateUp(opts: MigrateFlags)`; `command.subcommands` takes the
+//! first word as the variant (its name in kebab case, `MigrateUp` is `migrate-up`) and parses
+//! the rest against that record.
+//! A field type is any `command.Value`: the integer types, `f64`, `bool`, `String`, and `Option`
+//! and `List` of those; implement `Value` for your own (an enum, a duration) to add more.
+//! The attribute is `@[command(name, short, help, default)]`; `name` renames the flag (the field
+//! name with `_` as `-` is the default), `default` is the flag's text when it is left out.
+//!
+//! Every problem is collected, not just the first: an unknown flag, a missing value, a value
+//! that does not parse, a missing required flag; `Error.text` lists them with the usage.
+
+import std.io
+import std.env
+import std.error
+import std.strings
+
+/// `@[command(...)]` on a field (or a variant, for its `help`).
+pub attr command { name: str = "", short: str = "", help: str = "", default: str = "" }
+
+/// A type a flag can have.
+pub trait Value {
+    /// The type from the flag's text.
+    fn parse(text: String) -> Result[Self, String]
+    /// The type's name in the usage (`<integer>`).
+    fn kind() -> str
+    /// A flag that takes no value (`--verbose`).
+    fn flag() -> bool
+    /// May be left out with no default (an Option, a List, a bool).
+    fn optional() -> bool
+    /// Several occurrences are joined with `,` before parsing (a List).
+    fn repeated() -> bool
+    /// What an error leaves in the field (never seen by a program that checks the result).
+    fn fallback() -> Self
+}
+
+impl Value for String {
+    fn parse(text: String) -> Result[String, String] { Ok(text) }
+    fn kind() -> str { "text" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> String { String.from("") }
+}
+
+impl Value for bool {
+    fn parse(text: String) -> Result[bool, String] {
+        match strings.parse_bool(text) {
+            Some(b) => Ok(b)
+            None => Err(String.from("not true or false"))
+        }
+    }
+    fn kind() -> str { "bool" }
+    fn flag() -> bool { true }
+    fn optional() -> bool { true }
+    fn repeated() -> bool { false }
+    fn fallback() -> bool { false }
+}
+
+fn why(e: strings.ParseError) -> String { e.to_string() }
+
+impl Value for i64 {
+    fn parse(text: String) -> Result[i64, String] {
+        match strings.parse_i64(text) {
+            Ok(n) => Ok(n)
+            Err(e) => Err(why(e))
+        }
+    }
+    fn kind() -> str { "integer" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> i64 { 0 }
+}
+
+impl Value for i32 {
+    fn parse(text: String) -> Result[i32, String] {
+        match strings.parse_i32(text) {
+            Ok(n) => Ok(n)
+            Err(e) => Err(why(e))
+        }
+    }
+    fn kind() -> str { "integer" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> i32 { 0 }
+}
+
+impl Value for u32 {
+    fn parse(text: String) -> Result[u32, String] {
+        match strings.parse_u32(text) {
+            Ok(n) => Ok(n)
+            Err(e) => Err(why(e))
+        }
+    }
+    fn kind() -> str { "unsigned integer" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> u32 { 0 }
+}
+
+impl Value for u64 {
+    fn parse(text: String) -> Result[u64, String] {
+        match strings.parse_u64(text) {
+            Ok(n) => Ok(n)
+            Err(e) => Err(why(e))
+        }
+    }
+    fn kind() -> str { "unsigned integer" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> u64 { 0 }
+}
+
+impl Value for usize {
+    fn parse(text: String) -> Result[usize, String] {
+        match strings.parse_usize(text) {
+            Ok(n) => Ok(n)
+            Err(e) => Err(why(e))
+        }
+    }
+    fn kind() -> str { "unsigned integer" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> usize { 0 }
+}
+
+impl Value for f64 {
+    fn parse(text: String) -> Result[f64, String] {
+        match strings.parse_f64(text) {
+            Ok(n) => Ok(n)
+            Err(e) => Err(why(e))
+        }
+    }
+    fn kind() -> str { "number" }
+    fn flag() -> bool { false }
+    fn optional() -> bool { false }
+    fn repeated() -> bool { false }
+    fn fallback() -> f64 { 0.0 }
+}
+
+impl[T: Value] Value for Option[T] {
+    fn parse(text: String) -> Result[Option[T], String] {
+        match T.parse(text) {
+            Ok(v) => Ok(Some(v))
+            Err(e) => Err(e)
+        }
+    }
+    fn kind() -> str { T.kind() }
+    fn flag() -> bool { T.flag() }
+    fn optional() -> bool { true }
+    fn repeated() -> bool { false }
+    fn fallback() -> Option[T] { None }
+}
+
+impl[T: Value] Value for List[T] {
+    fn parse(text: String) -> Result[List[T], String] {
+        let mut out: List[T] = List.new()
+        if text.len() == 0 { return Ok(out) }
+        for part in strings.split(text, ",") {
+            match T.parse(part) {
+                Ok(v) => out.push(v)
+                Err(e) => { return Err(e) }
+            }
+        }
+        Ok(out)
+    }
+    fn kind() -> str { T.kind() }
+    fn flag() -> bool { false }
+    fn optional() -> bool { true }
+    fn repeated() -> bool { true }
+    fn fallback() -> List[T] { List.new() }
+}
+
+/// What the program gets: the options, and the words that were not flags (after `--`, or not
+/// starting with `-`), in order.
+pub type Parsed[T] = { opts: T, rest: List[String] }
+
+/// A command line that did not parse, or `--help`. `text` is what to print (the usage for
+/// help; the problems and the usage hint otherwise).
+pub type Error = { help: bool, text: String }
+
+impl error.Error for Error {
+    fn message(self) -> String { self.text.copy() }
+    fn source(self) -> Option[error.Failure] { None }
+}
+
+/// The flags seen so far while the record is being built.
+type Spec = { name: String, short: String, help: String, kind: String, default: String, required: bool, flag: bool }
+
+type State = { args: List[String], used: List[bool], specs: List[Spec], problems: List[String], help: bool, stop: usize }
+
+fn state(args: List[List[u8]]) -> State {
+    let mut a: List[String] = List.new()
+    let mut used: List[bool] = List.new()
+    let mut stop = args.len()
+    let mut i: usize = 0
+    for raw in args {
+        let s = match String.from_bytes(raw) {
+            Ok(x) => x
+            Err(_) => String.from("")
+        }
+        if i < stop && strings.trim(s) == String.from("--") { stop = i }
+        a.push(s)
+        used.push(false)
+        i += 1
+    }
+    let mut st = State(a, used, List.new(), List.new(), false, stop)
+    for j in 0..st.stop {
+        let w = st.args[j].copy()
+        if w == String.from("--help") || w == String.from("-h") {
+            st.help = true
+            st.used[j] = true
+        }
+    }
+    st
+}
+
+/// A field name as a flag: `max_conns` is `max-conns`.
+fn kebab(name: str) -> String {
+    let mut out = String.from("")
+    for b in name.bytes() {
+        if b == 95 { out.push_byte(45) } else if b >= 65 && b <= 90 {
+            if out.len() > 0 { out.push_byte(45) }
+            out.push_byte(b + 32)
+        } else { out.push_byte(b) }
+    }
+    out
+}
+
+fn problem(inout st: State, msg: String) { st.problems.push(msg) }
+
+/// The value of the flag for one field, from `st.args`; what the field's type, the attribute
+/// and the command line say. It never fails: a problem is recorded in `st` and the type's
+/// fallback returned, so the whole record is built and every problem found.
+fn value_of[F: Value](inout st: State, field: str, a_name: str, a_short: str, a_help: str, a_default: str) -> F {
+    let long = if a_name.len() > 0 { String.from(a_name) } else { kebab(field) }
+    let mut longf = String.from("--")
+    longf.append(long.copy())
+    let mut shortf = String.from("")
+    if a_short.len() > 0 {
+        shortf.push_str("-")
+        shortf.push_str(a_short)
+    }
+    let takes = !F.flag()
+    let req = !F.optional() && a_default.len() == 0
+    st.specs.push(Spec(long.copy(), String.from(a_short), String.from(a_help), String.from(F.kind()), String.from(a_default), req, F.flag()))
+    let mut texts: List[String] = List.new()
+    let mut i: usize = 0
+    while i < st.stop {
+        let w = st.args[i].copy()
+        let mut name_ok = w == longf
+        if shortf.len() > 0 && w == shortf { name_ok = true }
+        let mut eq = String.from("")
+        eq.append(longf.copy())
+        eq.push_str("=")
+        if strings.starts_with(w, eq.copy()) {
+            texts.push(w.slice(eq.len(), w.len()))
+            st.used[i] = true
+        } else if name_ok {
+            st.used[i] = true
+            if takes {
+                if i + 1 < st.stop && !st.used[i + 1] {
+                    texts.push(st.args[i + 1].copy())
+                    st.used[i + 1] = true
+                    i += 1
+                } else {
+                    problem(inout st, bytes_msg("--", long.copy(), " needs a value"))
+                }
+            } else {
+                texts.push(String.from("true"))
+            }
+        } else if !takes {
+            let mut no = String.from("--no-")
+            no.append(long.copy())
+            if w == no {
+                texts.push(String.from("false"))
+                st.used[i] = true
+            }
+        }
+        i += 1
+    }
+    if texts.len() == 0 {
+        if a_default.len() > 0 {
+            texts.push(String.from(a_default))
+        } else if F.optional() {
+            return F.fallback()
+        } else {
+            problem(inout st, bytes_msg("missing the required flag --", long.copy(), ""))
+            return F.fallback()
+        }
+    }
+    let joined = if F.repeated() { strings.join(texts, ",") } else { texts[texts.len() - 1].copy() }
+    match F.parse(joined) {
+        Ok(v) => v
+        Err(e) => {
+            let mut m = String.from("--")
+            m.append(long)
+            m.push_str(": ")
+            m.append(e)
+            problem(inout st, m)
+            F.fallback()
+        }
+    }
+}
+
+fn bytes_msg(a: str, b: String, c: str) -> String {
+    let mut m = String.from(a)
+    m.append(b)
+    m.push_str(c)
+    m
+}
+
+/// The usage text for `program` (`about` is its one-line description), from the specs.
+fn usage(program: String, about: str, specs: List[Spec], subs: List[String]) -> String {
+    let mut out = String.from("Usage: ")
+    out.append(program)
+    if subs.len() > 0 { out.push_str(" <command>") }
+    if specs.len() > 0 { out.push_str(" [flags]") }
+    out.push_str(" [--] [args...]\n")
+    if about.len() > 0 {
+        out.push_str(about)
+        out.push_str("\n")
+    }
+    if subs.len() > 0 {
+        out.push_str("\nCommands:\n")
+        for s in subs {
+            out.push_str("  ")
+            out.append(s.copy())
+            out.push_str("\n")
+        }
+    }
+    out.push_str("\nFlags:\n")
+    for s in specs {
+        let mut left = String.from("  ")
+        if s.short.len() > 0 {
+            left.push_str("-")
+            left.append(s.short.copy())
+            left.push_str(", ")
+        } else {
+            left.push_str("    ")
+        }
+        left.push_str("--")
+        left.append(s.name.copy())
+        if !s.flag {
+            left.push_str(" <")
+            left.append(s.kind.copy())
+            left.push_str(">")
+        }
+        let mut right = s.help.copy()
+        if s.default.len() > 0 || s.required {
+            if right.len() > 0 { right.push_str(" ") }
+            if s.default.len() > 0 {
+                right.push_str("(default ")
+                right.append(s.default.copy())
+                right.push_str(")")
+            } else {
+                right.push_str("(required)")
+            }
+        }
+        out.append(left.copy())
+        if right.len() > 0 {
+            if left.len() >= 30 { out.push_str("  ") }
+            while left.len() < 30 {
+                out.push_str(" ")
+                left.push_str(" ")
+            }
+            out.append(right)
+        }
+        out.push_str("\n")
+    }
+    out.push_str("  -h, --help                  print this help\n")
+    out
+}
+
+/// Whether anything was wrong, and the words that were not flags.
+fn finish[T](program: String, about: str, subs: List[String], st: State, opts: T) -> Result[Parsed[T], Error] {
+    if st.help { return Err(Error(true, usage(program, about, st.specs, subs))) }
+    let mut rest: List[String] = List.new()
+    let mut probs = st.problems.copy()
+    let mut i: usize = 0
+    while i < st.args.len() {
+        let w = st.args[i].copy()
+        if i == st.stop {
+            // the `--` itself
+        } else if i < st.stop && !st.used[i] && w.len() > 1 && strings.starts_with(w.copy(), "-") {
+            probs.push(bytes_msg("unknown flag ", w, ""))
+        } else if !st.used[i] || i > st.stop {
+            rest.push(w)
+        }
+        i += 1
+    }
+    if probs.len() > 0 {
+        let mut m = String.from("")
+        for p in probs {
+            m.append(program.copy())
+            m.push_str(": ")
+            m.append(p)
+            m.push_str("\n")
+        }
+        m.push_str("try `")
+        m.append(program.copy())
+        m.push_str(" --help`\n")
+        return Err(Error(false, m))
+    }
+    Ok(Parsed(opts, rest))
+}
+
+/// The record `R` read from `st`: one flag per field.
+fn record_of[R](inout st: State) -> R {
+    R(comptime for f in fields(R) {
+        value_of(inout st, f.name, attr[command](f).name, attr[command](f).short, attr[command](f).help, attr[command](f).default)
+    })
+}
+
+/// Parse `args` (without the program name: see `command.arguments`) into the record `T`; the type
+/// comes from where the result goes: `let p: Result[command.Parsed[Serve], command.Error] = command.parse(...)`.
+pub fn parse[T](program: str, about: str, args: List[List[u8]]) -> Result[Parsed[T], Error] {
+    let mut st = state(args)
+    let opts: T = record_of(inout st)
+    finish(String.from(program), about, List.new(), st, opts)
+}
+
+/// The command line of this program without its name (`env.args()` starts with it).
+pub fn arguments() -> List[List[u8]] uses io {
+    let all = env.args()
+    let mut out: List[List[u8]] = List.new()
+    for i in 1..all.len() { out.push(all[i].copy()) }
+    out
+}
+
+/// Parse `args` as a subcommand and its flags: the first word is a variant of the enum `C` in
+/// kebab case, whose one payload field is the record of its flags (`Serve(opts: ServeOpts)`);
+/// the rest are parsed against that record. The `@[command(help = "...")]` of a variant is its line
+/// in the command list. `tool help <command>` prints that command's usage, like `tool <command> --help`.
+pub fn subcommands[C](program: str, about: str, args: List[List[u8]]) -> Result[Parsed[C], Error] {
+    let mut names: List[String] = List.new()
+    comptime for v in variants(C) {
+        let mut line = kebab(v.name)
+        if attr[command](v).help != "" {
+            while line.len() < 18 { line.push_str(" ") }
+            line.push_str(attr[command](v).help)
+        }
+        names.push(line)
+    }
+    let none: List[Spec] = List.new()
+    let first = if args.len() > 0 { sys_text(args[0].copy()) } else { String.from("") }
+    // `tool help serve` is `tool serve --help`
+    if first == String.from("help") && args.len() > 1 {
+        let mut again: List[List[u8]] = List.new()
+        again.push(args[1].copy())
+        again.push(String.from("--help").bytes())
+        return subcommands[C](program, about, again)
+    }
+    if first.len() == 0 || first == String.from("help") || first == String.from("-h") || first == String.from("--help") {
+        return Err(Error(true, usage(String.from(program), about, none, names)))
+    }
+    let mut rest: List[List[u8]] = List.new()
+    for i in 1..args.len() { rest.push(args[i].copy()) }
+    comptime for v in variants(C) {
+        if first == kebab(v.name) {
+            let mut st = state(rest)
+            let x = v(comptime for f in fields(v) { record_of(inout st) })
+            let mut sub = String.from(program)
+            sub.push_str(" ")
+            sub.append(first.copy())
+            return finish(sub, about, List.new(), st, x)
+        }
+    }
+    let mut m = String.from(program)
+    m.push_str(": unknown command ")
+    m.append(first)
+    m.push_str("\n")
+    m.append(usage(String.from(program), about, none, names))
+    Err(Error(false, m))
+}
+
+fn sys_text(b: List[u8]) -> String {
+    match String.from_bytes(b) {
+        Ok(s) => s
+        Err(_) => String.from("")
+    }
+}
+
+/// Print an `Error` the way a command line tool does and give the exit code: help goes to
+/// stdout (exit 0), problems to stderr (exit 2).
+pub fn report(e: Error) -> i32 uses io {
+    if e.help {
+        io.out(e.text.bytes())
+        return 0
+    }
+    io.err(e.text.bytes())
+    2
+}
+
+// ---- shell completions
+
+/// A shell `completion` scripts can be written for.
+pub type Shell = | Bash | Zsh | Fish
+
+/// The shell named `name` ("bash", "zsh" or "fish"), if there is one.
+pub fn parse_shell(name: str) -> Option[Shell] {
+    let n = String.from(name)
+    if n == String.from("bash") { return Some(Bash) }
+    if n == String.from("zsh") { return Some(Zsh) }
+    if n == String.from("fish") { return Some(Fish) }
+    None
+}
+
+/// A subcommand: its name (kebab case), its help line and the flags of its record.
+type Sub = { name: String, help: String, specs: List[Spec] }
+
+/// The flags of the record `R`, in field order.
+fn specs_of[R]() -> List[Spec] {
+    let mut st = state(List.new())
+    let _r: R = record_of(inout st)
+    st.specs.copy()
+}
+
+/// The subcommands of the enum `C`.
+fn subs_of[C]() -> List[Sub] {
+    let mut out: List[Sub] = List.new()
+    comptime for v in variants(C) {
+        let mut st = state(List.new())
+        let _x = v(comptime for f in fields(v) { record_of(inout st) })
+        out.push(Sub(kebab(v.name), String.from(attr[command](v).help), st.specs.copy()))
+    }
+    out
+}
+
+/// `s` as one word for a POSIX shell (single quotes).
+fn sh_quote(s: String) -> String {
+    let mut o = String.from("'")
+    for b in s.bytes() {
+        if b == 39 { o.push_str("'\\''") } else { o.push_byte(b) }
+    }
+    o.push_str("'")
+    o
+}
+
+/// `s` for a single-quoted fish word.
+fn fish_quote(s: String) -> String {
+    let mut o = String.from("'")
+    for b in s.bytes() {
+        if b == 39 || b == 92 { o.push_byte(92) }
+        o.push_byte(b)
+    }
+    o.push_str("'")
+    o
+}
+
+/// `s` as a zsh `_arguments` description: `[` and `]` (the description's own delimiters)
+/// become parentheses.
+fn zsh_text(s: String) -> String {
+    let mut o = String.from("")
+    for b in s.bytes() {
+        if b == 91 { o.push_byte(40) } else if b == 93 { o.push_byte(41) } else { o.push_byte(b) }
+    }
+    o
+}
+
+/// The program's name as a shell function name.
+fn shell_ident(program: str) -> String {
+    let mut o = String.from("")
+    for b in program.bytes() {
+        let ok = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+        if ok { o.push_byte(b) } else { o.push_byte(95) }
+    }
+    o
+}
+
+/// The words a spec can be written as: `--name`, `-s`, and `--no-name` for a bool.
+fn spec_words(s: Spec) -> List[String] {
+    let mut w: List[String] = List.new()
+    w.push(bytes_msg("--", s.name.copy(), ""))
+    if s.short.len() > 0 { w.push(bytes_msg("-", s.short.copy(), "")) }
+    if s.flag { w.push(bytes_msg("--no-", s.name.copy(), "")) }
+    w
+}
+
+fn words_of(specs: List[Spec], extra: str) -> String {
+    let mut o = String.from("")
+    for s in specs {
+        for w in spec_words(s) {
+            o.append(w)
+            o.push_str(" ")
+        }
+    }
+    o.push_str(extra)
+    o
+}
+
+fn bash_script(program: str, top: List[Spec], subs: List[Sub]) -> String {
+    let id = shell_ident(program)
+    let mut o = String.from("# bash completion for ")
+    o.push_str(program)
+    o.push_str(" (generated by command.completion): `source` it, or save it in a bash-completion directory\n_")
+    o.append(id.copy())
+    o.push_str("() \x7b\n    local cur=\"\x24\x7bCOMP_WORDS[COMP_CWORD]\x7d\"\n    COMPREPLY=()\n")
+    if subs.len() > 0 {
+        let mut names = String.from("")
+        for s in subs.copy() {
+            names.append(s.name.copy())
+            names.push_str(" ")
+        }
+        o.push_str("    if [ \"\x24COMP_CWORD\" -eq 1 ]; then\n        COMPREPLY=( \x24(compgen -W ")
+        o.append(sh_quote(bytes_msg("", names.copy(), "help --help -h")))
+        o.push_str(" -- \"\x24cur\") )\n        return\n    fi\n    case \"\x24\x7bCOMP_WORDS[1]\x7d\" in\n")
+        for s in subs {
+            o.push_str("        ")
+            o.append(s.name.copy())
+            o.push_str(") COMPREPLY=( \x24(compgen -W ")
+            o.append(sh_quote(words_of(s.specs.copy(), "--help -h")))
+            o.push_str(" -- \"\x24cur\") ) ;;\n")
+        }
+        o.push_str("        help) COMPREPLY=( \x24(compgen -W ")
+        o.append(sh_quote(strings.trim(names)))
+        o.push_str(" -- \"\x24cur\") ) ;;\n    esac\n")
+    } else {
+        o.push_str("    COMPREPLY=( \x24(compgen -W ")
+        o.append(sh_quote(words_of(top, "--help -h")))
+        o.push_str(" -- \"\x24cur\") )\n")
+    }
+    o.push_str("\x7d\ncomplete -F _")
+    o.append(id)
+    o.push_str(" ")
+    o.push_str(program)
+    o.push_str("\n")
+    o
+}
+
+/// The `_arguments` specs for `specs`, one per word.
+fn zsh_arguments(specs: List[Spec]) -> String {
+    let mut o = String.from("")
+    for s in specs {
+        let mut tail = String.from("")
+        if !s.flag { tail = bytes_msg(":", s.kind.copy(), ":") }
+        let mut help = s.help.copy()
+        if s.default.len() > 0 {
+            if help.len() > 0 { help.push_str(" ") }
+            help.push_str("(default ")
+            help.append(s.default.copy())
+            help.push_str(")")
+        }
+        for w in spec_words(s.copy()) {
+            o.push_str(" ")
+            let mut arg = w.copy()
+            if help.len() > 0 {
+                arg.push_str("\x5b")
+                arg.append(zsh_text(help.copy()))
+                arg.push_str("\x5d")
+            }
+            arg.append(tail.copy())
+            o.append(sh_quote(arg))
+        }
+    }
+    o.push_str(" '--help[print help]' '-h[print help]'")
+    o
+}
+
+fn zsh_script(program: str, top: List[Spec], subs: List[Sub]) -> String {
+    let id = shell_ident(program)
+    let mut o = String.from("#compdef ")
+    o.push_str(program)
+    o.push_str("\n# zsh completion for ")
+    o.push_str(program)
+    o.push_str(" (generated by command.completion): save it as _")
+    o.push_str(program)
+    o.push_str(" in a directory of your fpath, or `source` it after compinit\n_")
+    o.append(id.copy())
+    o.push_str("() \x7b\n")
+    if subs.len() > 0 {
+        o.push_str("    local -a cmds\n    cmds=(\n")
+        for s in subs.copy() {
+            let mut line = s.name.copy()
+            line.push_str(":")
+            line.append(s.help.copy())
+            o.push_str("        ")
+            o.append(sh_quote(line))
+            o.push_str("\n")
+        }
+        o.push_str("        'help:print the help of a command'\n    )\n")
+        o.push_str("    if (( CURRENT == 2 )); then\n        _describe -t commands '")
+        o.push_str(program)
+        o.push_str(" command' cmds\n        return\n    fi\n    case \x24words[2] in\n")
+        for s in subs {
+            o.push_str("        ")
+            o.append(s.name.copy())
+            o.push_str(") _arguments")
+            o.append(zsh_arguments(s.specs.copy()))
+            o.push_str(" ;;\n")
+        }
+        o.push_str("        help) _describe -t commands '")
+        o.push_str(program)
+        o.push_str(" command' cmds ;;\n    esac\n")
+    } else {
+        o.push_str("    _arguments")
+        o.append(zsh_arguments(top))
+        o.push_str("\n")
+    }
+    o.push_str("\x7d\nif [ \"\x24funcstack[1]\" = \"_")
+    o.append(id.copy())
+    o.push_str("\" ]; then\n    _")
+    o.append(id.copy())
+    o.push_str(" \"\x24@\"\nelse\n    compdef _")
+    o.append(id)
+    o.push_str(" ")
+    o.push_str(program)
+    o.push_str("\nfi\n")
+    o
+}
+
+/// The `complete` lines for `specs`, each with the condition `cond` (a fish `-n` condition, or "").
+fn fish_flags(program: str, cond: String, specs: List[Spec]) -> String {
+    let mut o = String.from("")
+    for s in specs {
+        o.push_str("complete -c ")
+        o.push_str(program)
+        if cond.len() > 0 {
+            o.push_str(" -n ")
+            o.append(fish_quote(cond.copy()))
+        }
+        if s.short.len() > 0 {
+            o.push_str(" -s ")
+            o.append(s.short.copy())
+        }
+        o.push_str(" -l ")
+        o.append(s.name.copy())
+        if s.help.len() > 0 {
+            o.push_str(" -d ")
+            o.append(fish_quote(s.help.copy()))
+        }
+        if !s.flag { o.push_str(" -r") }
+        o.push_str("\n")
+        if s.flag {
+            o.push_str("complete -c ")
+            o.push_str(program)
+            if cond.len() > 0 {
+                o.push_str(" -n ")
+                o.append(fish_quote(cond.copy()))
+            }
+            o.push_str(" -l no-")
+            o.append(s.name.copy())
+            o.push_str("\n")
+        }
+    }
+    o.push_str("complete -c ")
+    o.push_str(program)
+    if cond.len() > 0 {
+        o.push_str(" -n ")
+        o.append(fish_quote(cond))
+    }
+    o.push_str(" -s h -l help -d 'print help'\n")
+    o
+}
+
+fn fish_script(program: str, top: List[Spec], subs: List[Sub]) -> String {
+    let mut o = String.from("# fish completion for ")
+    o.push_str(program)
+    o.push_str(" (generated by command.completion): save it as ~/.config/fish/completions/")
+    o.push_str(program)
+    o.push_str(".fish\n")
+    if subs.len() > 0 {
+        o.push_str("complete -c ")
+        o.push_str(program)
+        o.push_str(" -f\n")
+        for s in subs.copy() {
+            o.push_str("complete -c ")
+            o.push_str(program)
+            o.push_str(" -n __fish_use_subcommand -a ")
+            o.append(s.name.copy())
+            if s.help.len() > 0 {
+                o.push_str(" -d ")
+                o.append(fish_quote(s.help.copy()))
+            }
+            o.push_str("\n")
+        }
+        o.push_str("complete -c ")
+        o.push_str(program)
+        o.push_str(" -n __fish_use_subcommand -a help -d 'print the help of a command'\n")
+        for s in subs.copy() {
+            o.append(fish_flags(program, bytes_msg("__fish_seen_subcommand_from ", s.name.copy(), ""), s.specs.copy()))
+        }
+        let mut names = String.from("")
+        for s in subs {
+            names.append(s.name.copy())
+            names.push_str(" ")
+        }
+        o.push_str("complete -c ")
+        o.push_str(program)
+        o.push_str(" -n '__fish_seen_subcommand_from help' -a ")
+        o.append(fish_quote(strings.trim(names)))
+        o.push_str("\n")
+        o.push_str("complete -c ")
+        o.push_str(program)
+        o.push_str(" -n __fish_use_subcommand -s h -l help -d 'print help'\n")
+    } else {
+        o.append(fish_flags(program, String.from(""), top))
+    }
+    o
+}
+
+fn script(shell: Shell, program: str, top: List[Spec], subs: List[Sub]) -> String {
+    match shell {
+        Bash => bash_script(program, top, subs)
+        Zsh => zsh_script(program, top, subs)
+        Fish => fish_script(program, top, subs)
+    }
+}
+
+/// A completion script for `shell` for a program whose command line is the record `T` (the flags
+/// `command.parse[T]` reads). The program name is the one the shell completes. Print it, and tell
+/// users where their shell loads completions from (the script's first lines say).
+///
+///     let text = command.completion[Serve]("serve", command.Bash)
+pub fn completion[T](program: str, shell: Shell) -> String {
+    script(shell, program, specs_of[T](), List.new())
+}
+
+/// A completion script for a program with subcommands, the enum `C` that
+/// `command.subcommands[C]` reads: the command names (with their help), `help <command>`, and each
+/// command's flags after its name.
+pub fn subcommand_completion[C](program: str, shell: Shell) -> String {
+    script(shell, program, List.new(), subs_of[C]())
+}

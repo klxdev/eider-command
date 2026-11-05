@@ -1,0 +1,65 @@
+// command: shell completion scripts (bash, zsh, fish) for a record and for subcommands, and `help <command>`
+import command
+import std.io
+import std.bytes
+
+type Serve = {
+    @[command(help = "address to listen on", default = ":8080")] addr: String,
+    @[command(short = "w", help = "worker tasks", default = "4")] workers: i64,
+    @[command(short = "v", help = "log every request")] verbose: bool,
+    limit: Option[u32],
+}
+
+type ServeFlags = {
+    addr: String,
+    @[command(short = "w", default = "2")] workers: i64,
+}
+
+type MigrateFlags = { steps: Option[i64], dry_run: bool }
+
+type Cmd =
+    | @[command(help = "run the server")] Serve(opts: ServeFlags)
+    | @[command(help = "apply migrations")] MigrateUp(opts: MigrateFlags)
+
+fn words(line: str) -> List[List[u8]] {
+    if line.len() == 0 { return List.new() }
+    bytes.split(line.bytes(), 32)
+}
+
+fn main() uses io {
+    match command.parse_shell("fish") {
+        Some(_) => print("fish is a shell")
+        None => print("no")
+    }
+    match command.parse_shell("csh") {
+        Some(_) => print("csh is a shell")
+        None => print("csh is not a shell")
+    }
+    print("-- bash, flags of a record")
+    io.out(command.completion[Serve]("my-tool", command.Bash).bytes())
+    print("-- zsh, flags of a record")
+    io.out(command.completion[Serve]("my-tool", command.Zsh).bytes())
+    print("-- fish, flags of a record")
+    io.out(command.completion[Serve]("my-tool", command.Fish).bytes())
+    print("-- bash, subcommands")
+    io.out(command.subcommand_completion[Cmd]("tool", command.Bash).bytes())
+    print("-- zsh, subcommands")
+    io.out(command.subcommand_completion[Cmd]("tool", command.Zsh).bytes())
+    print("-- fish, subcommands")
+    io.out(command.subcommand_completion[Cmd]("tool", command.Fish).bytes())
+    print("-- help <command>")
+    let r: Result[command.Parsed[Cmd], command.Error] = command.subcommands("tool", "a tool", words("help migrate-up"))
+    match r {
+        Ok(_) => print("parsed")
+        Err(e) => {
+            print(e.help)
+            io.out(e.text.bytes())
+        }
+    }
+    print("-- help alone is the command list")
+    let r2: Result[command.Parsed[Cmd], command.Error] = command.subcommands("tool", "a tool", words("help"))
+    match r2 {
+        Ok(_) => print("parsed")
+        Err(e) => io.out(e.text.bytes())
+    }
+}
